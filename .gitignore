@@ -1,0 +1,22 @@
+# 编译产物
+__pycache__/
+*.py[cod]
+*.pyo
+
+# 打包产物
+build/
+dist/
+*.spec
+
+# 本机查询缓存与临时目录
+cache/
+.build_tmp/
+.build_tools/
+_t.txt
+_ui.txt
+_commitmsg.txt
+
+# 编辑器
+.vscode/
+.idea/
+*.swp

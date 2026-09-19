@@ -1,5 +1,9 @@
 # 炉石原画查询器（hsfinder）
 
+> 仓库地址：<https://github.com/kanfenga/Hearthstone-find-art>
+>
+> 克隆：`git clone https://github.com/kanfenga/Hearthstone-find-art.git`
+
 输入**卡牌中文名**，一次给出：
 
 - 普通版 / 金卡版画师

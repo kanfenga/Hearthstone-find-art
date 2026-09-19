@@ -26,6 +26,11 @@ import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from tkinter import ttk, messagebox
 
+try:
+    from PIL import ImageTk          # 预览需要（Pillow）
+except Exception:                    # 没装也不影响查询，只是预览不可用
+    ImageTk = None
+
 APP_NAME = "hsfinder"
 APP_TITLE = "炉石原画查询器"
 VERSION = "1.1"
@@ -242,25 +247,35 @@ def source_of(filename):
 # ---------------------------------------------------------------------------
 # 图片：Tk 只能直接显示 GIF/PNG，而 wiki 原画全是 JPEG，必须先转
 # ---------------------------------------------------------------------------
-def image_to_png_b64(data):
-    """图片字节 -> PNG 的 base64，供 tk.PhotoImage 使用。
 
-    用 Pillow 完成转换；打包 exe 时 PyInstaller 会自动把它带上。
-    没有 Pillow 时返回 None，由界面提示 —— 转换不是核心功能，
-    不值得为此塞进一堆平台相关代码。
-    """
-    import base64
-    if data[:8] == b"\x89PNG\r\n\x1a\n":
-        return base64.b64encode(data)
+def decode_image(data):
+    """图片字节 -> PIL Image；没有 Pillow 时返回 None。"""
     try:
         import io
         from PIL import Image
-        im = Image.open(io.BytesIO(data)).convert("RGB")
-        buf = io.BytesIO()
-        im.save(buf, format="PNG")
-        return base64.b64encode(buf.getvalue())
+        return Image.open(io.BytesIO(data)).convert("RGB")
     except Exception:
         return None
+
+
+def fit_image_to_box(im, box_w, box_h):
+    """把图像按比例缩放到刚好铺满 box_w（高度不够时以高度为准）。
+
+    只缩小不放大：小图放大只会发虚，保持原始尺寸更实在。
+    用 LANCZOS 精确缩放，而不是 tk 的 subsample —— 后者只能按 1/n 整数倍缩小，
+    结果常常比面板窄一截，看着就像没对齐。
+    """
+    try:
+        from PIL import Image
+    except Exception:
+        return im
+    w, h = im.size
+    box_w = max(40, int(box_w))
+    box_h = max(40, int(box_h))
+    scale = min(box_w / w, box_h / h, 1.0)
+    if scale >= 0.999:
+        return im
+    return im.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +539,11 @@ class App:
         self.result = None
         self.preview_img = None
         self._preview_ticket = 0
+        self._preview_src = None        # 下载后解码好的 PIL 图像，窗口缩放时复用
+        self._preview_meta = (None, None, None)   # (原图宽, 原图高, 文件名)
+        self._preview_box = (0, 0)      # 上次渲染用的可用尺寸
+        self._preview_w = 0             # 图片当前按哪个宽度铺满的
+        self._resize_job = None
 
         root.title(f"{APP_TITLE} {VERSION}")
         root.geometry("1080x740")
@@ -590,19 +610,29 @@ class App:
 
         body = ttk.Frame(self.root, padding=(16, 4, 16, 6))
         body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=0, minsize=360)
-        body.columnconfigure(1, weight=1)
+        # 预览面板跟着窗口一起变宽（权重给得比右侧小，保证详情区更宽），
+        # 这样「图片铺满面板宽度」在放大窗口后才真的有意义。
+        body.columnconfigure(0, weight=2, minsize=360)
+        body.columnconfigure(1, weight=3)
         body.rowconfigure(0, weight=1)
 
         # 左：预览
         left = tk.Frame(body, bg="#ffffff", highlightthickness=1,
                         highlightbackground="#e3e5e8")
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
-        self.preview = tk.Label(left, text="原画预览", bg="#ffffff", fg="#9aa0a6",
-                                font=FONT_SMALL)
-        self.preview.pack(fill="both", expand=True, padx=8, pady=8)
+        # 用固定尺寸的容器包住预览图：否则图片会把控件反向撑大，
+        # 面板宽度就不再由布局决定，「铺满宽度」也就无从谈起。
+        self.preview_holder = tk.Frame(left, bg="#ffffff")
+        self.preview_holder.pack(fill="both", expand=True, padx=8, pady=(8, 2))
+        self.preview_holder.pack_propagate(False)
+        self.preview = tk.Label(self.preview_holder, text="原画预览", bg="#ffffff",
+                                fg="#9aa0a6", font=FONT_SMALL, anchor="center",
+                                justify="center")
+        self.preview.pack(fill="both", expand=True)
+        # 容器尺寸变化时按新宽度重新铺满
+        self.preview_holder.bind("<Configure>", self._on_preview_resize)
         self.preview_note = tk.Label(left, text="", bg="#ffffff", fg="#9aa0a6",
-                                     font=("Microsoft YaHei UI", 8), wraplength=330)
+                                     font=("Microsoft YaHei UI", 8), justify="center")
         self.preview_note.pack(fill="x", padx=8, pady=(0, 8))
 
         # 右：详情
@@ -777,6 +807,8 @@ class App:
         self.preview.configure(image="", text="原画预览")
         self.preview_note.configure(text="")
         self.preview_img = None
+        self._preview_src = None          # 换卡时丢掉上一张的预览图
+        self._preview_meta = (None, None, None)
         self.result = res
 
         if res.get("error"):
@@ -856,18 +888,20 @@ class App:
                          daemon=True).start()
 
     def _preview_worker(self, ticket, url, w, h):
-        """下载缩略图并转成 PNG（Tk 不认 JPEG，必须先转）。
+        """下载缩略图、解码成 PIL 图像，交给界面按面板宽度铺满。
 
         缩略图 URL 必须用下划线形式：wiki 对「700px-带空格的文件名」返回 400，
         而对下划线形式正常出图。取不到缩略图时才退回原图（可能十几 MB）。
+        这里传回解码后的图像而不是 PNG 字节，是为了窗口缩放时能重新缩放，
+        而不必重新联网下载。
         """
         try:
             base = url.split("?")[0]
             name = base.rsplit("/", 1)[-1]           # 保持下划线形式
             host = url.split("/images/")[0]
             data = None
-            # 700px 对预览足够清晰，体积只有原图的百分之几
-            for candidate in (f"{host}/images/thumb/{name}/700px-{name}", base):
+            # 900px 比预览最大宽度略大，缩到面板宽度时仍清晰
+            for candidate in (f"{host}/images/thumb/{name}/900px-{name}", base):
                 try:
                     data = http_get(candidate, timeout=40)
                     break
@@ -875,38 +909,85 @@ class App:
                     continue
             if not data:
                 raise RuntimeError("缩略图与原图都取不到")
-            png_b64 = image_to_png_b64(data)
-            self.queue.put(("preview", (ticket, png_b64, w, h)))
+            im = decode_image(data)
+            if im is None:
+                raise RuntimeError("没有 Pillow，无法解码图片")
+            self.queue.put(("preview", (ticket, im, w, h, name)))
         except Exception as e:
-            self.queue.put(("preview", (ticket, None, w, h, f"{type(e).__name__}: {e}")))
+            self.queue.put(("preview", (ticket, None, w, h, None,
+                                        f"{type(e).__name__}: {e}")))
+
+    def _preview_box_get(self):
+        """预览区可用尺寸：宽度取容器宽度，高度按宽度反推（宽度优先）。
+
+        图片铺满容器宽度，高度按原比例算出；高出容器的部分会被容器裁掉底部。
+        为了少裁一点，卡片图都是竖的，所以高度按宽度 ×1.6 预留。
+        """
+        bw = self.preview_holder.winfo_width()
+        bh = self.preview_holder.winfo_height()
+        if bw <= 1:
+            bw = max(200, self.preview.winfo_reqwidth())
+        box_w = max(60, bw - 2)
+        want_h = int(box_w * 1.6) + 8
+        if bh <= 1:
+            bh = want_h
+        return box_w, max(want_h, bh)
+
+    def _render_preview(self):
+        """按当前面板宽度把图像铺满并显示。"""
+        if self._preview_src is None:
+            return
+        if ImageTk is None:
+            self.preview.configure(image="", text="原画预览")
+            self.preview_note.configure(
+                text="预览需要 Pillow：pip install pillow\n（不影响查询与原画链接）")
+            return
+        box_w, box_h = self._preview_box_get()
+        self._preview_box = (box_w, box_h)
+        self._preview_w = box_w
+        try:
+            fitted = fit_image_to_box(self._preview_src, box_w, box_h)
+            self.preview_img = ImageTk.PhotoImage(fitted)
+            self.preview.configure(image=self.preview_img, text="")
+            ow, oh, _ = self._preview_meta
+            fw, fh = fitted.size
+            self.preview_note.configure(
+                text=f"原图 {ow}×{oh}    显示 {fw}×{fh}")
+        except Exception as e:
+            self.preview.configure(image="", text=f"预览失败：{e}")
+
+    def _on_preview_resize(self, event):
+        """面板尺寸变化时重新铺满（150ms 去抖，避免拖动窗口时反复缩放）。"""
+        if self._preview_src is None:
+            return
+        if abs(event.width - self._preview_w) < 3:
+            return
+        if self._resize_job is not None:
+            try:
+                self.root.after_cancel(self._resize_job)
+            except Exception:
+                pass
+        self._resize_job = self.root.after(150, self._render_preview)
 
     def _show_preview(self, payload):
-        ticket, png_b64 = payload[0], payload[1]
+        ticket, im = payload[0], payload[1]
         w = payload[2] if len(payload) > 2 else None
         h = payload[3] if len(payload) > 3 else None
-        err = payload[4] if len(payload) > 4 else None
+        name = payload[4] if len(payload) > 4 else None
+        err = payload[5] if len(payload) > 5 else None
         if ticket != self._preview_ticket:
             return
-        if not png_b64:
-            self.preview.configure(image="", text="原画预览")
+        if im is None:
+            # 已经显示过图就不要把它擦掉，只更新提示
+            if self._preview_src is None:
+                self.preview.configure(image="", text="原画预览")
             self.preview_note.configure(
                 text=f"预览图不可用（{err}）\n可点右侧链接在浏览器打开原图")
             return
-        try:
-            img = tk.PhotoImage(data=png_b64)
-            maxw, maxh = 340, 470
-            step = 1
-            while img.width() // step > maxw or img.height() // step > maxh:
-                step += 1
-            if step > 1:
-                img = img.subsample(step, step)
-            self.preview_img = img
-            self.preview.configure(image=img, text="")
-            scale = f"（按 1/{step} 缩放）" if step > 1 else ""
-            self.preview_note.configure(text=f"原图 {w}×{h} {scale}")
-        except Exception as e:
-            self.preview.configure(image="", text="原画预览")
-            self.preview_note.configure(text=f"预览失败：{e}")
+        self._preview_src = im
+        self._preview_meta = (w, h, name)
+        # 布局此刻可能还没算完，等一拍再按真实宽度缩放
+        self.root.after_idle(self._render_preview)
 
     # -- 按钮 -----------------------------------------------------------------
     def on_open_wiki(self):

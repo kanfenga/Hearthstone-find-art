@@ -28,7 +28,7 @@ from tkinter import ttk, messagebox
 
 APP_NAME = "hsfinder"
 APP_TITLE = "炉石原画查询器"
-VERSION = "1.0"
+VERSION = "1.1"
 
 API = "https://hearthstone.wiki.gg/api.php"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

@@ -23,6 +23,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor
 from tkinter import ttk, messagebox
 
 APP_NAME = "hsfinder"
@@ -153,41 +154,113 @@ def imageinfo(filename):
     return ii
 
 
+def imageinfo_many(filenames):
+    """一次请求查多个文件的信息，返回 {文件名: imageinfo 或 None}。
+
+    MediaWiki 支持 titles=A|B|C，这样一次查询只花一次往返，
+    而逐个查要 N 次 —— 这是查询慢的主因。
+    """
+    names = [f for f in filenames if f]
+    if not names:
+        return {}
+    if len(names) == 1:
+        return {names[0]: imageinfo(names[0])}
+    titles = "|".join(f"File:{n}" for n in names)
+    d = api(action="query", titles=titles, prop="imageinfo",
+            iiprop="url|size|mime", format="json", formatversion=2)
+    out = {n: None for n in names}
+    # 页面名和图片文件名可能一个带下划线一个带空格，比对前统一成同一个键
+    norm = {n.replace("_", " "): n for n in names}
+    for p in (d.get("query") or {}).get("pages") or []:
+        title = (p.get("title") or "").replace("File:", "").strip()
+        ii = (p.get("imageinfo") or [None])[0]
+        if not ii or not ii.get("url"):
+            continue
+        key = norm.get(title.replace("_", " "))
+        if key:
+            out[key] = ii
+    return out
+
+
+def sources_many(filenames):
+    """一次请求取多个 File 页的 wikitext 并抠出链接，返回 {文件名: [url]}。"""
+    names = [f for f in filenames if f]
+    if not names:
+        return {}
+    titles = "|".join(f"File:{n}" for n in names)
+    d = api(action="query", titles=titles, prop="revisions",
+            rvprop="content", rvslots="main", format="json", formatversion=2)
+    out = {n: [] for n in names}
+    norm = {n.replace("_", " "): n for n in names}
+    for p in (d.get("query") or {}).get("pages") or []:
+        title = (p.get("title") or "").replace("File:", "").strip()
+        revs = p.get("revisions") or []
+        content = ""
+        if revs:
+            content = ((revs[0].get("slots") or {}).get("main") or {}).get("content") or ""
+        key = norm.get(title.replace("_", " "))
+        if key:
+            out[key] = URL_RE.findall(content)
+    return out
+
+
 def wiki_search(text, limit=8):
     """全文搜索，用于索引里没有的名字（英文名、外号、写错的中文名）。"""
     d = api(action="query", list="search", srsearch=text, srlimit=limit, format="json")
     return [(r.get("title"), r.get("size")) for r in (d.get("query") or {}).get("search") or []]
 
 
-def page_files(page, kind):
-    """从卡片页的图片列表里找全幅原稿的真实文件名。
+def page_files_all(page):
+    """列出卡片页上的全幅原稿文件名，返回 {"full": 名, "signature_full": 名}。
 
     文件名不总是「页面名 + _full.jpg」：例如 Power Word: Glory 的实际文件是
-    Power_Word-_Glory_full.jpg（冒号被换成横线），靠拼接猜不到，只能去页面里找。
-    kind: "full" 或 "signature_full"。
+    「Power Word- Glory full.jpg」（冒号被换成横线，且分隔符可能是空格），
+    靠拼接猜不到，只能去页面里找。一次请求把两种都取回来。
     """
-    d = api(action="query", titles=page, prop="images", imlimit=200,
+    d = api(action="query", titles=page, prop="images", imlimit=300,
             format="json", formatversion=2)
     pages = (d.get("query") or {}).get("pages") or []
-    want = f"_{kind}.jpg"
-    hits = []
+    out = {}
     for p in pages:
         for im in p.get("images") or []:
             title = (im.get("title") or "").replace("File:", "")
-            if title.endswith(want) or title.lower().endswith(want):
-                hits.append(title)
-    if not hits:
-        return None
-    # 优先不含 "(golden)" 之类后缀的规范名
-    hits.sort(key=lambda s: (len(s), s))
-    return hits[0]
+            # _full.jpg / -full.jpg / " full.jpg" 都算；signature_full 优先匹配
+            if re.search(r"[\s_-]signature[\s_-]full\.jpg$", title, re.I):
+                out.setdefault("signature_full", title)
+            elif re.search(r"[\s_-]full\.jpg$", title, re.I):
+                out.setdefault("full", title)
+    return out
 
 
 def source_of(filename):
-    """File 描述页 wikitext 里的 source 字段 = 画师本人的发布链接。"""
+    """单个 File 页 wikitext 里的 source 字段 = 画师本人的发布链接。"""
     d = api(action="parse", page=f"File:{filename}", prop="wikitext",
             format="json", formatversion=2)
     return URL_RE.findall(((d.get("parse") or {}).get("wikitext") or ""))
+
+
+# ---------------------------------------------------------------------------
+# 图片：Tk 只能直接显示 GIF/PNG，而 wiki 原画全是 JPEG，必须先转
+# ---------------------------------------------------------------------------
+def image_to_png_b64(data):
+    """图片字节 -> PNG 的 base64，供 tk.PhotoImage 使用。
+
+    用 Pillow 完成转换；打包 exe 时 PyInstaller 会自动把它带上。
+    没有 Pillow 时返回 None，由界面提示 —— 转换不是核心功能，
+    不值得为此塞进一堆平台相关代码。
+    """
+    import base64
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return base64.b64encode(data)
+    try:
+        import io
+        from PIL import Image
+        im = Image.open(io.BytesIO(data)).convert("RGB")
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue())
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -355,41 +428,69 @@ class Finder:
             "images": {},
         }
 
-        def file_info(names):
-            """按候选文件名依次试，返回 (文件名, imageinfo)。"""
-            for nm in names:
-                if not nm:
-                    continue
-                ii = imageinfo(nm)
-                if ii:
-                    return nm, ii
-            return None, None
+        # ---- 原画与来源：互不依赖，并行发出；只有猜不到文件名时才去查页面图片列表 ----
+        names_main = [f"{base}_full.jpg"]
+        names_sig = [f"{base}_signature_full.jpg"]
+        if base_alt and base_alt != base:
+            names_main.append(f"{base_alt}_full.jpg")
+            names_sig.append(f"{base_alt}_signature_full.jpg")
+        all_names = names_main + names_sig
 
-        for tag, key in (("regular", "full"), ("signature", "signature_full")):
-            say(f"查询{'异画' if tag == 'signature' else '普通版'}全幅原画…")
-            # 先按页面名猜（命中率最高），猜不到再去卡片页的图片列表里找真实文件名
-            fn, ii = file_info([f"{base}_{key}.jpg",
-                                f"{base_alt}_{key}.jpg" if base_alt != base else None])
+        say("查询原画与画师来源…")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_info = pool.submit(imageinfo_many, all_names)
+            fut_src = pool.submit(sources_many, all_names)
+            try:
+                infos = fut_info.result()
+            except ApiError:
+                infos = {}
+            try:
+                srcs = fut_src.result()
+            except ApiError:
+                srcs = {}
+
+        fallback_cache = {}
+
+        def pick(cands, tag_key):
+            """挑第一个真实存在的候选；都不存在才去页面图片列表里兜底。
+
+            兜底只做一次（整张卡共享），避免普通版和异画各查一遍。
+            """
+            for nm in cands:
+                if infos.get(nm):
+                    return nm, infos[nm]
+            if "files" not in fallback_cache:
+                try:
+                    fallback_cache["files"] = page_files_all(page)
+                except ApiError:
+                    fallback_cache["files"] = {}
+            real = (fallback_cache["files"] or {}).get(tag_key)
+            if not real:
+                return None, None
+            ii = infos.get(real)
             if not ii:
                 try:
-                    real = page_files(page, key)
+                    ii = imageinfo(real)
                 except ApiError:
-                    real = None
-                if real:
-                    fn, ii = real, imageinfo(real)
+                    return None, None
+            if ii and real not in srcs:
+                try:
+                    srcs[real] = source_of(real)
+                except ApiError:
+                    pass
+            return (real, ii) if ii else (None, None)
+
+        for tag, key in (("regular", "full"), ("signature", "signature_full")):
+            fn, ii = pick(names_main if tag == "regular" else names_sig, key)
             if not ii:
                 result["images"][tag] = None
                 continue
-            try:
-                src = source_of(fn)
-            except ApiError:
-                src = []
             result["images"][tag] = {
                 "file": fn,
                 "width": ii.get("width"),
                 "height": ii.get("height"),
                 "url": ii.get("url"),
-                "sources": src,
+                "sources": srcs.get(fn) or [],
             }
         if use_cache:
             self.cache[key] = result
@@ -568,9 +669,9 @@ class App:
     # -- 交互 -----------------------------------------------------------------
     def _set_status(self, text, busy=False):
         self.status.configure(text=text)
-        if busy and not self.busy:
-            self.progress.start(12)
-        elif not busy and self.busy:
+        if busy:
+            self.progress.start(12)      # 重复调用是幂等的，定时器不会叠加
+        else:
             self.progress.stop()
         self.busy = busy
         self.go.state(["disabled"] if busy else ["!disabled"])
@@ -745,6 +846,7 @@ class App:
         im = (res.get("images") or {}).get("regular") or (res.get("images") or {}).get("signature")
         if not im or not im.get("url"):
             self.preview.configure(text="没有可预览的原画")
+            self.preview_note.configure(text="")
             return
         self._preview_ticket += 1
         ticket = self._preview_ticket
@@ -754,29 +856,45 @@ class App:
                          daemon=True).start()
 
     def _preview_worker(self, ticket, url, w, h):
+        """下载缩略图并转成 PNG（Tk 不认 JPEG，必须先转）。
+
+        缩略图 URL 必须用下划线形式：wiki 对「700px-带空格的文件名」返回 400，
+        而对下划线形式正常出图。取不到缩略图时才退回原图（可能十几 MB）。
+        """
         try:
-            # 走 wiki 的缩略图服务，避免拉十几 MB 的原图
-            thumb = url
-            if w and w > 700:
-                name = url.rsplit("/", 1)[-1].split("?")[0]
-                thumb = url.split("/images/")[0] + f"/images/thumb/{name}/700px-{name}"
-            data = http_get(thumb, timeout=30)
-            self.queue.put(("preview", (ticket, data, w, h)))
-        except Exception:
-            self.queue.put(("preview", (ticket, None, w, h)))
+            base = url.split("?")[0]
+            name = base.rsplit("/", 1)[-1]           # 保持下划线形式
+            host = url.split("/images/")[0]
+            data = None
+            # 700px 对预览足够清晰，体积只有原图的百分之几
+            for candidate in (f"{host}/images/thumb/{name}/700px-{name}", base):
+                try:
+                    data = http_get(candidate, timeout=40)
+                    break
+                except Exception:
+                    continue
+            if not data:
+                raise RuntimeError("缩略图与原图都取不到")
+            png_b64 = image_to_png_b64(data)
+            self.queue.put(("preview", (ticket, png_b64, w, h)))
+        except Exception as e:
+            self.queue.put(("preview", (ticket, None, w, h, f"{type(e).__name__}: {e}")))
 
     def _show_preview(self, payload):
-        ticket, data, w, h = payload
+        ticket, png_b64 = payload[0], payload[1]
+        w = payload[2] if len(payload) > 2 else None
+        h = payload[3] if len(payload) > 3 else None
+        err = payload[4] if len(payload) > 4 else None
         if ticket != self._preview_ticket:
             return
-        if not data:
-            self.preview.configure(text="原画预览")
-            self.preview_note.configure(text="预览图载入失败（可点右侧链接直接打开）")
+        if not png_b64:
+            self.preview.configure(image="", text="原画预览")
+            self.preview_note.configure(
+                text=f"预览图不可用（{err}）\n可点右侧链接在浏览器打开原图")
             return
         try:
-            import base64
-            img = tk.PhotoImage(data=base64.b64encode(data))
-            maxw, maxh = 330, 430
+            img = tk.PhotoImage(data=png_b64)
+            maxw, maxh = 340, 470
             step = 1
             while img.width() // step > maxw or img.height() // step > maxh:
                 step += 1
@@ -784,9 +902,10 @@ class App:
                 img = img.subsample(step, step)
             self.preview_img = img
             self.preview.configure(image=img, text="")
-            self.preview_note.configure(text=f"预览（原图 {w}×{h}）")
+            scale = f"（按 1/{step} 缩放）" if step > 1 else ""
+            self.preview_note.configure(text=f"原图 {w}×{h} {scale}")
         except Exception as e:
-            self.preview.configure(text="原画预览")
+            self.preview.configure(image="", text="原画预览")
             self.preview_note.configure(text=f"预览失败：{e}")
 
     # -- 按钮 -----------------------------------------------------------------

@@ -40,7 +40,7 @@ python -X utf8 hsfinder_app.py 时空大盗拉法姆
 
 | 位置 | 含义 |
 |---|---|
-| 左侧 | 原画预览（走 wiki 的 700px 缩略图，不会为了预览拉十几 MB 原图） |
+| 左侧 | 原画预览（走 wiki 的 900px 缩略图，不会为了预览拉十几 MB 原图；装了 Pillow 用它，没装用系统 GDI+） |
 | 卡牌 ID | 如 `TIME_005`，**想知道别的卡就查它** |
 | 普通/金卡画师 | wiki 记录的普通版画师 |
 | 异画画师 | 异画是另请画师画的独立作品，与普通版常常不是同一人 |
@@ -90,13 +90,17 @@ python build_exe.py
 | 项目 | 说明 |
 |---|---|
 | Python | 3.8+，只用标准库 + tkinter（Windows 官方安装包自带） |
-| Pillow | 仅用于**左侧原画预览**（Tk 不能直接显示 JPEG，需要转成 PNG）。没装也不影响查询，只是预览会提示不可用；打包 exe 时会自动带上 |
-| 第三方库 | 除 Pillow 外无（打包 exe 需要 PyInstaller；生成图标需要 Pillow） |
+| Pillow | **可选**：装了预览画质更好、缩放更快；没装会自动改用 Windows 自带的 GDI+ 解码，预览照常显示。打包 exe 时会自动带上 |
+| 第三方库 | 无必装项（打包 exe 需要 PyInstaller） |
 | 数据源 | [hearthstone.wiki.gg](https://hearthstone.wiki.gg) 的 Cargo / MediaWiki 公开 API |
 | 缓存 | 查过的卡会缓存到 `%LOCALAPPDATA%\hsfinder\cache.json`，二次查询瞬时返回 |
 
 一次查询只发 **3 次**网络请求（画师 1 次；原画信息与画师来源并行各 1 次），
-典型耗时约 1.2~1.8 秒。原画预览单独走 700px 缩略图，不会为了预览拉十几 MB 原图。
+典型耗时约 1.2~1.8 秒。原画预览单独走 900px 缩略图，不会为了预览拉十几 MB 原图。
+
+**预览为什么不需要装 Pillow**：Tk 不能直接显示 JPEG，必须转码。有 Pillow 时用
+Pillow 转；没有时调用 Windows 自带的 `gdiplus.dll`（系统组件，必然存在）解码并
+缩放。两条路输出尺寸与画质一致，只是实现不同。
 
 网络被墙或 wiki 挂了会明确提示「连不上 wiki」，**不会**谎报成「这张卡不存在」。
 查询太频繁会收到限流提示，等几秒即可（程序内置了请求间隔）。

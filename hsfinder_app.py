@@ -258,6 +258,210 @@ def decode_image(data):
         return None
 
 
+# ---------------------------------------------------------------------------
+# 没有 Pillow 时的兜底：用 Windows 自带的 GDI+ 解码并缩放
+# ---------------------------------------------------------------------------
+class _GdiPlus:
+    """GDI+ 的最小 ctypes 封装（只在缺 Pillow 时用到）。
+
+    好处是零依赖：只要系统有 gdiplus.dll 就能解 JPEG/PNG/GIF/BMP，
+    不必让使用者去装 Pillow。缩放走 HighQualityBicubic，画质够看。
+    """
+    _instance = None
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes as wt
+
+        class GdiplusStartupInput(ctypes.Structure):
+            _fields_ = [("GdiplusVersion", wt.UINT),
+                        ("DebugEventCallback", ctypes.c_void_p),
+                        ("SuppressBackgroundThread", wt.BOOL),
+                        ("SuppressExternalCodecs", wt.BOOL)]
+
+        self.ctypes, self.wt = ctypes, wt
+        gdi = ctypes.WinDLL("gdiplus")
+        ole = ctypes.WinDLL("ole32")
+        sh = ctypes.WinDLL("shlwapi")
+
+        gdi.GdiplusStartup.argtypes = [ctypes.POINTER(ctypes.c_void_p),
+                                       ctypes.POINTER(GdiplusStartupInput),
+                                       ctypes.c_void_p]
+        gdi.GdiplusStartup.restype = ctypes.c_int
+        ole.CoInitializeEx.argtypes = [ctypes.c_void_p, wt.DWORD]
+        sh.SHCreateMemStream.argtypes = [ctypes.c_char_p, wt.UINT]
+        sh.SHCreateMemStream.restype = ctypes.c_void_p
+        self.gdi, self.ole, self.sh = gdi, ole, sh
+        self.token = ctypes.c_void_p()
+        self._input = GdiplusStartupInput(1, None, False, False)
+        self.available = gdi.GdiplusStartup(ctypes.byref(self.token),
+                                            ctypes.byref(self._input), None) == 0
+
+    @classmethod
+    def get(cls):
+        if cls._instance is None:
+            try:
+                cls._instance = cls()
+            except Exception:
+                cls._instance = False        # 记下失败，别反复重试
+        return cls._instance or None
+
+    def decode(self, data):
+        """JPEG/PNG/... 字节 -> (宽, 高, RGB bytes)；失败返回 None。"""
+        ctypes, wt, gdi = self.ctypes, self.wt, self.gdi
+        self.ole.CoInitializeEx(None, 2)                 # APARTMENTTHREADED
+        stream = self.sh.SHCreateMemStream(data, len(data))
+        if not stream:
+            return None
+        bitmap = ctypes.c_void_p()
+        try:
+            gdi.GdipCreateBitmapFromStream.argtypes = [ctypes.c_void_p,
+                                                       ctypes.POINTER(ctypes.c_void_p)]
+            gdi.GdipCreateBitmapFromStream.restype = ctypes.c_int
+            if gdi.GdipCreateBitmapFromStream(ctypes.c_void_p(stream),
+                                              ctypes.byref(bitmap)) != 0 or not bitmap:
+                return None
+            gdi.GdipGetImageWidth.argtypes = [ctypes.c_void_p, ctypes.POINTER(wt.UINT)]
+            gdi.GdipGetImageHeight.argtypes = [ctypes.c_void_p, ctypes.POINTER(wt.UINT)]
+            w, h = wt.UINT(0), wt.UINT(0)
+            gdi.GdipGetImageWidth(bitmap, ctypes.byref(w))
+            gdi.GdipGetImageHeight(bitmap, ctypes.byref(h))
+            w, h = int(w.value), int(h.value)
+            if not (0 < w <= 20000 and 0 < h <= 20000):
+                return None
+            return self._pixels(bitmap, w, h)
+        finally:
+            if bitmap:
+                gdi.GdipDisposeImage.argtypes = [ctypes.c_void_p]
+                gdi.GdipDisposeImage(bitmap)
+            self._release_stream(stream)
+
+    def _release_stream(self, stream):
+        """IStream::Release（虚表第 3 项）。"""
+        ctypes, wt = self.ctypes, self.wt
+        try:
+            vtbl = ctypes.cast(ctypes.c_void_p(stream),
+                               ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+            ctypes.WINFUNCTYPE(wt.ULONG, ctypes.c_void_p)(vtbl[2])(ctypes.c_void_p(stream))
+        except Exception:
+            pass
+
+    def _pixels(self, bitmap, w, h):
+        """把 GDI+ 位图读成 RGB bytes。"""
+        ctypes, wt, gdi = self.ctypes, self.wt, self.gdi
+        rect = (ctypes.c_uint32 * 4)(0, 0, w, h)
+
+        class BitmapData(ctypes.Structure):
+            _fields_ = [("width", wt.UINT), ("height", wt.UINT),
+                        ("stride", ctypes.c_int), ("pixel_format", ctypes.c_int),
+                        ("scan0", ctypes.c_void_p), ("reserved", ctypes.c_void_p)]
+
+        gdi.GdipBitmapLockBits.argtypes = [ctypes.c_void_p, ctypes.c_void_p, wt.UINT,
+                                           ctypes.c_int, ctypes.POINTER(BitmapData)]
+        gdi.GdipBitmapUnlockBits.argtypes = [ctypes.c_void_p,
+                                             ctypes.POINTER(BitmapData)]
+        data = BitmapData()
+        # ImageLockModeRead = 1，PixelFormat24bppRGB = 0x00021808
+        if gdi.GdipBitmapLockBits(bitmap, rect, 1, 0x00021808,
+                                  ctypes.byref(data)) != 0:
+            return None
+        try:
+            stride = data.stride
+            buf = ctypes.string_at(data.scan0, stride * h)
+        finally:
+            gdi.GdipBitmapUnlockBits(bitmap, ctypes.byref(data))
+        if stride == w * 3:
+            return w, h, buf
+        rgb = bytearray(w * h * 3)                    # 逐行裁掉填充字节
+        for y in range(h):
+            rgb[y * w * 3:(y + 1) * w * 3] = buf[y * stride:y * stride + w * 3]
+        return w, h, bytes(rgb)
+
+    def load_scaled_png(self, data, box_w, box_h):
+        """解码 + 缩放到 box 内 + 编码成 PNG，返回 base64；失败返回 None。"""
+        got = self.decode(data)
+        if not got:
+            return None
+        w, h, rgb = got
+        scale = min(box_w / w, box_h / h, 1.0)
+        nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+        if (nw, nh) != (w, h):
+            resized = self._resize_rgb(w, h, rgb, nw, nh)
+            if resized:
+                nw, nh, rgb = resized
+        return _rgb_to_png_b64(nw, nh, rgb)
+
+    def _resize_rgb(self, w, h, rgb, nw, nh):
+        """用 GDI+ 做一次高质量缩放。"""
+        ctypes, gdi = self.ctypes, self.gdi
+        stride = (w * 3 + 3) & ~3
+        if stride != w * 3:
+            return None
+        buf = ctypes.create_string_buffer(rgb, len(rgb))
+        gdi.GdipCreateBitmapFromScan0.argtypes = [
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        gdi.GdipCreateBitmapFromScan0.restype = ctypes.c_int
+        src, dst, g = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+        try:
+            # PixelFormat24bppRGB = 0x00021808
+            if gdi.GdipCreateBitmapFromScan0(w, h, stride, 0x00021808, buf,
+                                             ctypes.byref(src)) != 0 or not src:
+                return None
+            if gdi.GdipCreateBitmapFromScan0(nw, nh, 0, 0x00021808, None,
+                                             ctypes.byref(dst)) != 0 or not dst:
+                return None
+            gdi.GdipGetImageGraphicsContext.argtypes = [ctypes.c_void_p,
+                                                        ctypes.POINTER(ctypes.c_void_p)]
+            if gdi.GdipGetImageGraphicsContext(dst, ctypes.byref(g)) != 0 or not g:
+                return None
+            gdi.GdipSetInterpolationMode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            gdi.GdipSetInterpolationMode(g, 7)         # HighQualityBicubic
+            gdi.GdipSetPixelOffsetMode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            gdi.GdipSetPixelOffsetMode(g, 2)           # Half
+            gdi.GdipDrawImageRectI.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+            gdi.GdipDrawImageRectI(g, src, 0, 0, nw, nh)
+            gdi.GdipDeleteGraphics.argtypes = [ctypes.c_void_p]
+            gdi.GdipDeleteGraphics(g)
+            g = ctypes.c_void_p()
+            return self._pixels(dst, nw, nh)
+        finally:
+            if g:
+                gdi.GdipDeleteGraphics.argtypes = [ctypes.c_void_p]
+                gdi.GdipDeleteGraphics(g)
+            gdi.GdipDisposeImage.argtypes = [ctypes.c_void_p]
+            if src:
+                gdi.GdipDisposeImage(src)
+            if dst:
+                gdi.GdipDisposeImage(dst)
+
+
+def _rgb_to_png_b64(w, h, rgb):
+    """裸 RGB 像素 -> PNG 的 base64（tk.PhotoImage 直接可吃）。"""
+    import base64
+    import struct
+    import zlib
+    png = bytearray(b"\x89PNG\r\n\x1a\n")
+
+    def chunk(tag, payload):
+        png.extend(struct.pack(">I", len(payload)))
+        png.extend(tag)
+        png.extend(payload)
+        png.extend(struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF))
+
+    chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+    raw = bytearray()
+    stride = w * 3
+    for y in range(h):
+        raw.append(0)
+        raw.extend(rgb[y * stride:(y + 1) * stride])
+    chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+    chunk(b"IEND", b"")
+    return base64.b64encode(bytes(png))
+
+
 def fit_image_to_box(im, box_w, box_h):
     """把图像按比例缩放到刚好铺满 box_w（高度不够时以高度为准）。
 
@@ -539,7 +743,7 @@ class App:
         self.result = None
         self.preview_img = None
         self._preview_ticket = 0
-        self._preview_src = None        # 下载后解码好的 PIL 图像，窗口缩放时复用
+        self._preview_bytes = None      # 下载到的图片原始字节，缩放时复用
         self._preview_meta = (None, None, None)   # (原图宽, 原图高, 文件名)
         self._preview_box = (0, 0)      # 上次渲染用的可用尺寸
         self._preview_w = 0             # 图片当前按哪个宽度铺满的
@@ -807,7 +1011,7 @@ class App:
         self.preview.configure(image="", text="原画预览")
         self.preview_note.configure(text="")
         self.preview_img = None
-        self._preview_src = None          # 换卡时丢掉上一张的预览图
+        self._preview_bytes = None        # 换卡时丢掉上一张的预览图
         self._preview_meta = (None, None, None)
         self.result = res
 
@@ -888,12 +1092,13 @@ class App:
                          daemon=True).start()
 
     def _preview_worker(self, ticket, url, w, h):
-        """下载缩略图、解码成 PIL 图像，交给界面按面板宽度铺满。
+        """下载缩略图并解码，交给界面按面板宽度铺满。
 
         缩略图 URL 必须用下划线形式：wiki 对「700px-带空格的文件名」返回 400，
         而对下划线形式正常出图。取不到缩略图时才退回原图（可能十几 MB）。
-        这里传回解码后的图像而不是 PNG 字节，是为了窗口缩放时能重新缩放，
-        而不必重新联网下载。
+
+        这里只下载不解码：解码要在主线程按「实际面板宽度」做，
+        这样窗口缩放时能重新缩放而不必重新联网。
         """
         try:
             base = url.split("?")[0]
@@ -909,10 +1114,7 @@ class App:
                     continue
             if not data:
                 raise RuntimeError("缩略图与原图都取不到")
-            im = decode_image(data)
-            if im is None:
-                raise RuntimeError("没有 Pillow，无法解码图片")
-            self.queue.put(("preview", (ticket, im, w, h, name)))
+            self.queue.put(("preview", (ticket, data, w, h, name)))
         except Exception as e:
             self.queue.put(("preview", (ticket, None, w, h, None,
                                         f"{type(e).__name__}: {e}")))
@@ -921,7 +1123,7 @@ class App:
         """预览区可用尺寸：宽度取容器宽度，高度按宽度反推（宽度优先）。
 
         图片铺满容器宽度，高度按原比例算出；高出容器的部分会被容器裁掉底部。
-        为了少裁一点，卡片图都是竖的，所以高度按宽度 ×1.6 预留。
+        卡片图基本是竖的，所以高度按宽度 ×1.6 预留，尽量少裁。
         """
         bw = self.preview_holder.winfo_width()
         bh = self.preview_holder.winfo_height()
@@ -934,31 +1136,47 @@ class App:
         return box_w, max(want_h, bh)
 
     def _render_preview(self):
-        """按当前面板宽度把图像铺满并显示。"""
-        if self._preview_src is None:
-            return
-        if ImageTk is None:
-            self.preview.configure(image="", text="原画预览")
-            self.preview_note.configure(
-                text="预览需要 Pillow：pip install pillow\n（不影响查询与原画链接）")
+        """按当前面板宽度把图像铺满并显示，两条路：
+
+        1. 有 Pillow：ImageTk 直接显示，窗口缩放时重新 LANCZOS 缩放；
+        2. 没有 Pillow：退回 Windows 自带的 GDI+ 解码缩放，再让 tk 显示 PNG。
+           对方机器不装 Pillow 也能看到预览。
+        """
+        data = self._preview_bytes
+        if not data:
             return
         box_w, box_h = self._preview_box_get()
         self._preview_box = (box_w, box_h)
         self._preview_w = box_w
+        ow, oh, _ = self._preview_meta
         try:
-            fitted = fit_image_to_box(self._preview_src, box_w, box_h)
-            self.preview_img = ImageTk.PhotoImage(fitted)
-            self.preview.configure(image=self.preview_img, text="")
-            ow, oh, _ = self._preview_meta
-            fw, fh = fitted.size
-            self.preview_note.configure(
-                text=f"原图 {ow}×{oh}    显示 {fw}×{fh}")
+            if ImageTk is not None:
+                im = decode_image(data)
+                if im is None:
+                    raise RuntimeError("Pillow 无法解码该图片")
+                fitted = fit_image_to_box(im, box_w, box_h)
+                self.preview_img = ImageTk.PhotoImage(fitted)
+                self.preview.configure(image=self.preview_img, text="")
+                fw, fh = fitted.size
+            else:
+                gp = _GdiPlus.get()
+                if gp is None or not gp.available:
+                    raise RuntimeError("系统没有可用的 gdiplus.dll")
+                b64 = gp.load_scaled_png(data, box_w, box_h)
+                if not b64:
+                    raise RuntimeError("GDI+ 无法解码该图片")
+                self.preview_img = tk.PhotoImage(data=b64)
+                self.preview.configure(image=self.preview_img, text="")
+                fw, fh = self.preview_img.width(), self.preview_img.height()
+            self.preview_note.configure(text=f"原图 {ow}×{oh}    显示 {fw}×{fh}")
         except Exception as e:
-            self.preview.configure(image="", text=f"预览失败：{e}")
+            if self.preview_img is None:
+                self.preview.configure(image="", text="原画预览")
+            self.preview_note.configure(text=f"预览失败：{e}")
 
     def _on_preview_resize(self, event):
         """面板尺寸变化时重新铺满（150ms 去抖，避免拖动窗口时反复缩放）。"""
-        if self._preview_src is None:
+        if not self._preview_bytes:
             return
         if abs(event.width - self._preview_w) < 3:
             return
@@ -970,21 +1188,21 @@ class App:
         self._resize_job = self.root.after(150, self._render_preview)
 
     def _show_preview(self, payload):
-        ticket, im = payload[0], payload[1]
+        ticket, data = payload[0], payload[1]
         w = payload[2] if len(payload) > 2 else None
         h = payload[3] if len(payload) > 3 else None
         name = payload[4] if len(payload) > 4 else None
         err = payload[5] if len(payload) > 5 else None
         if ticket != self._preview_ticket:
             return
-        if im is None:
+        if data is None:
             # 已经显示过图就不要把它擦掉，只更新提示
-            if self._preview_src is None:
+            if not self._preview_bytes:
                 self.preview.configure(image="", text="原画预览")
             self.preview_note.configure(
                 text=f"预览图不可用（{err}）\n可点右侧链接在浏览器打开原图")
             return
-        self._preview_src = im
+        self._preview_bytes = data
         self._preview_meta = (w, h, name)
         # 布局此刻可能还没算完，等一拍再按真实宽度缩放
         self.root.after_idle(self._render_preview)

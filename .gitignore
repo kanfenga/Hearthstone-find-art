@@ -10,13 +10,11 @@ dist/
 
 # 本机查询缓存与临时目录
 cache/
+.testcache/
 .build_tmp/
 .build_tools/
-_t.txt
-_ui.txt
-_commitmsg.txt
 
-# 编辑器
-.vscode/
-.idea/
-*.swp
+# 开发期间的一次性文件（临时脚本、提交信息草稿、截图等）
+# 统一用下划线开头，全部忽略，避免误提交
+_*
+!.gitignore

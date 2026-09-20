@@ -18,7 +18,7 @@
       "cards": {
          "时空大盗拉法姆": {
             "id": "TIME_005", "dbfId": 119432, "type": "MINION",
-            "collectible": true, "tier": [1, 1, 1, 119432],
+            "rarity": "LEGENDARY", "collectible": true, "tier": [1, 1, 1, 119432],
             "others": [["HERO_07bk", "HERO"]]        # 同名但无独立原画的衍生实体
          },
          ...
@@ -32,11 +32,13 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# 依次尝试：脚本同目录、上一层、以及老版本工具集的 _art_tools 目录
+# 产物放进包目录，随程序分发（core.paths.resource_path 会在这里找）
+PKG_DIR = os.path.join(HERE, "hsfinder")
+DEFAULT_OUT = os.path.join(PKG_DIR, "names.json")
+# 依次尝试：仓库根、脚本同目录、以及老版本工具集的 _art_tools 目录
 CANDIDATE_SRC = [
     os.path.join(HERE, "cards_zhCN.json"),
-    os.path.join(os.path.dirname(HERE), "cards_zhCN.json"),
-    os.path.join(os.path.dirname(HERE), "_art_tools", "cards_zhCN.json"),
+    os.path.join(HERE, "_art_tools", "cards_zhCN.json"),
 ]
 DEFAULT_SRC = next((p for p in CANDIDATE_SRC if os.path.exists(p)), CANDIDATE_SRC[0])
 CARD_DATA_URL = "https://api.hearthstonejson.com/v1/latest/{locale}/cards.json"
@@ -92,7 +94,7 @@ def load_source(path, locale, fetch):
 def main():
     ap = argparse.ArgumentParser(description="生成查名索引 names.json")
     ap.add_argument("source", nargs="?", default=DEFAULT_SRC, help="cards_<locale>.json 路径")
-    ap.add_argument("-o", "--out", default=os.path.join(HERE, "names.json"))
+    ap.add_argument("-o", "--out", default=DEFAULT_OUT)
     ap.add_argument("-l", "--locale", default="zhCN")
     ap.add_argument("--fetch", action="store_true", help="本地没有卡表时联网下载")
     args = ap.parse_args()
@@ -120,6 +122,7 @@ def main():
             "id": best.get("id"),
             "dbfId": best.get("dbfId"),
             "type": best.get("type"),
+            "rarity": best.get("rarity"),
             "collectible": bool(best.get("collectible")),
             "tier": card_tier(best),
             "others": [[i, t] for i, t in others],
@@ -131,6 +134,7 @@ def main():
         "count": len(out),
         "cards": out,
     }
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
 
@@ -140,7 +144,8 @@ def main():
         v = out.get(probe)
         if v:
             extra = f"  同名衍生: {v['others']}" if v["others"] else ""
-            print(f"  抽查 {probe:8s} -> {v['id']} dbfId={v['dbfId']}{extra}")
+            print(f"  抽查 {probe:8s} -> {v['id']} dbfId={v['dbfId']} "
+                  f"{v.get('type')}/{v.get('rarity')}{extra}")
 
 
 if __name__ == "__main__":

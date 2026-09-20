@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from .. import config
 from .api import cargo, imageinfo, imageinfo_many, page_files_all, source_of, \
     sources_many, wiki_search
+from .http import ApiError
 
 
 class Finder:
@@ -167,12 +168,19 @@ class Finder:
         with ThreadPoolExecutor(max_workers=2) as pool:
             fut_info = pool.submit(imageinfo_many, all_names)
             fut_src = pool.submit(sources_many, all_names)
+            # 网络/限流类失败必须往上抛，否则用户会看到「这本卡没有原画」，
+            # 而真相是刚才请求没成功。其它意外错误才降级成空结果。
             try:
                 infos = fut_info.result()
+            except ApiError:
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
             except Exception:
                 infos = {}
             try:
                 srcs = fut_src.result()
+            except ApiError:
+                raise
             except Exception:
                 srcs = {}
 
@@ -186,6 +194,8 @@ class Finder:
             if "files" not in fallback:
                 try:
                     fallback["files"] = page_files_all(page)
+                except ApiError:
+                    raise
                 except Exception:
                     fallback["files"] = {}
             real = (fallback["files"] or {}).get(kind)
@@ -195,13 +205,15 @@ class Finder:
             if not got:
                 try:
                     got = imageinfo(real)
+                except ApiError:
+                    raise
                 except Exception:
                     return None, None
             if got and real not in srcs:
                 try:
                     srcs[real] = source_of(real)
-                except Exception:
-                    pass
+                except (ApiError, Exception):
+                    pass          # 来源只是锦上添花，拿不到不影响主结果
             return (real, got) if got else (None, None)
 
         for tag, names, kind in (("regular", names_main, "full"),

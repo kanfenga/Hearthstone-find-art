@@ -199,8 +199,6 @@ class SearchBox(tk.Frame):
         self.entry.bind("<FocusOut>", self._on_focus_out)
         if on_submit:
             self.entry.bind("<Return>", lambda e: on_submit())
-        if on_change:
-            self.var.trace_add("write", lambda *a: on_change())
         if on_navigate:
             self.entry.bind("<Down>", lambda e: on_navigate(1))
             self.entry.bind("<Up>", lambda e: on_navigate(-1))
@@ -209,18 +207,33 @@ class SearchBox(tk.Frame):
 
         self._show_placeholder()
 
+        # 占位符设置完再挂变更回调：否则构造期间就会被自己触发一次，
+        # 那时调用方往往还没把本控件存进自己的属性里（会 AttributeError）。
+        self._ready = False
+        if on_change:
+            self.var.trace_add("write", lambda *a: self._ready and on_change())
+        self._ready = True
+
     # -- 占位提示 -----------------------------------------------------------
     def _show_placeholder(self):
+        """没有真实内容时显示占位提示。"""
+        if self.var.get() == self.placeholder:
+            # 控件里已经就是占位串（例如刚构造完）
+            self._showing_placeholder = True
+            self.entry.configure(fg=Colors.text_faint)
+            return
         if not self.var.get():
             self._showing_placeholder = True
             self.entry.configure(fg=Colors.text_faint)
             self.var.set(self.placeholder)
+            return
+        self._showing_placeholder = False
+        self.entry.configure(fg=Colors.text)
 
     def _clear_placeholder(self):
-        if self._showing_placeholder:
-            self._showing_placeholder = False
-            self.var.set("")
-            self.entry.configure(fg=Colors.text)
+        self._showing_placeholder = False
+        self.var.set("")
+        self.entry.configure(fg=Colors.text)
 
     def _on_focus_in(self, _e=None):
         self.configure(bg=Colors.focus)
@@ -235,9 +248,11 @@ class SearchBox(tk.Frame):
         return "" if self._showing_placeholder else self.var.get().strip()
 
     def set(self, text):
+        """设置内容。传空串会恢复占位提示，而不是留一个空白框。"""
         self._showing_placeholder = False
         self.entry.configure(fg=Colors.text)
         self.var.set(text)
+        self._show_placeholder()
 
     def focus(self):
         self.entry.focus_set()

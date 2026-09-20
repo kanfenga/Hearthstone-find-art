@@ -3,6 +3,8 @@
 > 仓库地址：<https://github.com/kanfenga/Hearthstone-find-art>
 >
 > 克隆：`git clone https://github.com/kanfenga/Hearthstone-find-art.git`
+>
+> **版本 0.9.0** —— 尚未正式发布，1.0 留给首个稳定版。
 
 输入**卡牌中文名**，一次给出：
 
@@ -135,6 +137,7 @@ hsfinder-gui.cmd         双击启动器（纯 ASCII）
 **改界面**：颜色、字体、间距都在 `ui/theme.py`，不要在各处写死颜色值。
 **加字段**：在 `ui/app.py` 的 `FIELDS` 里加一行，再到 `_render` 里填值即可。
 **改网络行为**：超时、重试、节流间隔都在 `config.py`。
+**改版本号**：只改 `hsfinder/meta.py`，窗口标题会跟着变。
 
 ---
 

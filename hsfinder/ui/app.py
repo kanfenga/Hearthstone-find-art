@@ -126,8 +126,26 @@ class App:
                  font=self.fonts.title()).pack(anchor="w")
         tk.Label(left, text=DESCRIPTION, bg=Colors.bg, fg=Colors.text_muted,
                  font=self.fonts.small()).pack(anchor="w", pady=(2, 0))
-        tk.Label(head, text=f"v{VERSION}", bg=Colors.bg, fg=Colors.text_faint,
-                 font=self.fonts.caption()).pack(side="right", anchor="n")
+
+        right = tk.Frame(head, bg=Colors.bg)
+        right.pack(side="right", anchor="n")
+        tk.Label(right, text=f"v{VERSION}", bg=Colors.bg, fg=Colors.text_faint,
+                 font=self.fonts.caption()).pack(anchor="e")
+        self.backend_lbl = tk.Label(right, text="", bg=Colors.bg,
+                                    fg=Colors.text_faint, font=self.fonts.caption())
+        self.backend_lbl.pack(anchor="e", pady=(2, 0))
+        self._describe_backend()
+
+    def _describe_backend(self):
+        """在标题栏角落标出预览用的解码后端，方便排查「预览不显示」。"""
+        from ..core.images import GdiPlus, has_pillow
+        if has_pillow():
+            note = "预览：Pillow"
+        elif GdiPlus.get() is not None and GdiPlus.get().available:
+            note = "预览：系统 GDI+"
+        else:
+            note = "预览不可用"
+        self.backend_lbl.configure(text=note)
 
     def _build_search(self, parent):
         wrap = tk.Frame(parent, bg=Colors.bg)
@@ -265,6 +283,8 @@ class App:
         try:
             res = self.finder.find(text, log=lambda m: self.queue.put(("status", m)))
         except ApiError as e:
+            # 网络类失败单独标出来：它不是「这张卡不存在」，
+            # 界面要用不同措辞与配色，避免误导用户
             res = {"query": text, "error": str(e), "api_error": True}
         except Exception as e:
             res = {"query": text, "error": f"出错了：{type(e).__name__}: {e}"}
@@ -279,7 +299,8 @@ class App:
                 elif kind == "result":
                     self._render(payload)
                     if payload.get("error"):
-                        self._set_busy(False, payload["error"], "error")
+                        kind_ = "warning" if payload.get("api_error") else "error"
+                        self._set_busy(False, payload["error"], kind_)
                     else:
                         self._set_busy(False, "完成", "success")
                 elif kind == "preview":
@@ -325,16 +346,20 @@ class App:
         self.preview.clear()
 
         if res.get("error"):
-            self.name_lbl.configure(text="没查到", fg=Colors.danger)
+            api_error = bool(res.get("api_error"))
+            # 网络/限流问题不能说成「没查到」——那会让人以为这张卡不存在
+            self.name_lbl.configure(text="连接失败" if api_error else "没查到",
+                                    fg=Colors.warning if api_error else Colors.danger)
             self.sub_lbl.configure(text=res["error"], fg=Colors.text_muted)
             self._set_actions(False)
-            cands = res.get("candidates") or []
-            if cands:
-                row = self.rows["card_id"]
-                row.set("可能想找的是（点一下再查）：", Colors.text_muted)
-                for name in cands:
-                    row.add_link("· " + name,
-                                 command=lambda n=name: self._pick_name(n))
+            if not api_error:
+                cands = res.get("candidates") or []
+                if cands:
+                    row = self.rows["card_id"]
+                    row.set("可能想找的是（点一下再查）：", Colors.text_muted)
+                    for name in cands:
+                        row.add_link("· " + name,
+                                     command=lambda n=name: self._pick_name(n))
             return
 
         self.name_lbl.configure(text=self._display_name(res), fg=Colors.text)
